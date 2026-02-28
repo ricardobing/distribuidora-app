@@ -1,0 +1,100 @@
+version: "3.9"
+
+services:
+  # ──────────────────────────────────────────────
+  # PostgreSQL 16 + PostGIS 3.4
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: molymarket-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER:-moly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-molypass}
+      POSTGRES_DB:       ${POSTGRES_DB:-molymarket}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - molymarket-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-moly} -d ${POSTGRES_DB:-molymarket}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ──────────────────────────────────────────────
+  # FastAPI Backend
+  # ──────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: molymarket-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL:          postgresql+asyncpg://${POSTGRES_USER:-moly}:${POSTGRES_PASSWORD:-molypass}@postgres:5432/${POSTGRES_DB:-molymarket}
+      SECRET_KEY:            ${SECRET_KEY:-change-me-in-production-at-least-32-chars}
+      ALGORITHM:             HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 480
+      GOOGLE_MAPS_API_KEY:   ${GOOGLE_MAPS_API_KEY:-}
+      OPENAI_API_KEY:        ${OPENAI_API_KEY:-}
+      ORS_API_KEY:           ${ORS_API_KEY:-}
+      MAPBOX_TOKEN:          ${MAPBOX_TOKEN:-}
+      ALLOWED_ORIGINS:       ${ALLOWED_ORIGINS:-http://localhost:3000}
+      ENVIRONMENT:           ${ENVIRONMENT:-development}
+    # Run migrations then start server
+    command: >
+      sh -c "
+        echo 'Waiting for DB...' &&
+        alembic upgrade head &&
+        echo 'Migrations OK' &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+      "
+    ports:
+      - "8000:8000"
+    networks:
+      - molymarket-net
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ──────────────────────────────────────────────
+  # Next.js Frontend
+  # ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    container_name: molymarket-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000/api/v1}
+    ports:
+      - "3000:3000"
+    networks:
+      - molymarket-net
+
+volumes:
+  postgres_data:
+    name: molymarket-postgres-data
+
+networks:
+  molymarket-net:
+    name: molymarket-net
+    driver: bridge
