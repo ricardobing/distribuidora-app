@@ -1,78 +1,85 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+"""
+Router de autenticación y gestión de usuarios.
+"""
+from datetime import timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, status, Path
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.dependencies import get_db, get_current_user, require_admin
-from app.schemas.auth import LoginRequest, TokenResponse, UserCreate, UserResponse, PasswordChange, UserUpdate
-from app.core.security import verify_password, create_access_token, hash_password
-from app.core.exceptions import not_found, bad_request
-from app.models.usuario import Usuario, UserRol
+from app.models.usuario import Usuario
+from app.schemas.auth import (
+    LoginRequest, TokenResponse, UserCreate, UserResponse,
+    PasswordChange, UserUpdate,
+)
+from app.schemas.common import OkResponse
+from app.core.security import (
+    hash_password, verify_password, create_access_token,
+)
 from app.config import settings
-from sqlalchemy import select, update as sql_update
-from datetime import timedelta
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Usuario).where(Usuario.email == body.email))
-    user = result.scalar_one_or_none()
-    if not user or not verify_password(body.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales incorrectas")
-    if not user.activo:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuario desactivado")
-    token = create_access_token(
-        data={"sub": str(user.id), "rol": user.rol},
-        expires_delta=timedelta(hours=settings.ACCESS_TOKEN_EXPIRE_HOURS)
+    """Autentica usuario y devuelve JWT."""
+    result = await db.execute(
+        select(Usuario).where(Usuario.email == body.email.lower().strip())
     )
+    user = result.scalar_one_or_none()
+
+    if not user or not user.activo:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas",
+        )
+    if not verify_password(body.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas",
+        )
+
+    expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    token = create_access_token(subject=user.id, expires_delta=expires)
+
     return TokenResponse(
         access_token=token,
-        expires_in=settings.ACCESS_TOKEN_EXPIRE_HOURS * 3600,
+        token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user_id=user.id,
         email=user.email,
-        rol=user.rol
+        rol=user.rol,
     )
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user: Usuario = Depends(get_current_user)):
+async def me(current_user: Usuario = Depends(get_current_user)):
+    """Retorna el usuario autenticado."""
     return current_user
 
 
-@router.put("/me/password")
+@router.put("/me/password", response_model=OkResponse)
 async def change_password(
     body: PasswordChange,
     db: AsyncSession = Depends(get_db),
-    current_user: Usuario = Depends(get_current_user)
+    current_user: Usuario = Depends(get_current_user),
 ):
+    """Cambia contraseña del usuario autenticado."""
     if not verify_password(body.old_password, current_user.password_hash):
-        raise bad_request("Contraseña actual incorrecta")
-    await db.execute(
-        sql_update(Usuario)
-        .where(Usuario.id == current_user.id)
-        .values(password_hash=hash_password(body.new_password))
-    )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Contraseña actual incorrecta",
+        )
+    current_user.password_hash = hash_password(body.new_password)
     await db.commit()
-    return {"ok": True}
+    return OkResponse(message="Contraseña actualizada correctamente")
 
 
-@router.post("/register", response_model=UserResponse, dependencies=[Depends(require_admin)])
-async def register(body: UserCreate, db: AsyncSession = Depends(get_db)):
-    existing = await db.execute(select(Usuario).where(Usuario.email == body.email))
-    if existing.scalar_one_or_none():
-        raise bad_request("Email ya registrado")
-    user = Usuario(
-        email=body.email,
-        password_hash=hash_password(body.password),
-        nombre=body.nombre,
-        rol=body.rol,
-        activo=True
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-    return user
-
+# ---------------------------------------------------------------------------
+# Gestión de usuarios (solo admin)
+# ---------------------------------------------------------------------------
 
 @router.get("/users", response_model=list[UserResponse], dependencies=[Depends(require_admin)])
 async def list_users(db: AsyncSession = Depends(get_db)):
@@ -80,12 +87,38 @@ async def list_users(db: AsyncSession = Depends(get_db)):
     return result.scalars().all()
 
 
+@router.post("/users", response_model=UserResponse, dependencies=[Depends(require_admin)])
+async def create_user(body: UserCreate, db: AsyncSession = Depends(get_db)):
+    existing = await db.execute(
+        select(Usuario).where(Usuario.email == body.email.lower().strip())
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Email '{body.email}' ya registrado",
+        )
+    user = Usuario(
+        email=body.email.lower().strip(),
+        nombre=body.nombre or body.email.split("@")[0],
+        password_hash=hash_password(body.password),
+        rol=body.rol,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
 @router.put("/users/{user_id}", response_model=UserResponse, dependencies=[Depends(require_admin)])
-async def update_user(user_id: int, body: UserUpdate, db: AsyncSession = Depends(get_db)):
+async def update_user(
+    user_id: int = Path(...),
+    body: UserUpdate = ...,
+    db: AsyncSession = Depends(get_db),
+):
     result = await db.execute(select(Usuario).where(Usuario.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
-        raise not_found("Usuario")
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
     if body.nombre is not None:
         user.nombre = body.nombre
     if body.rol is not None:

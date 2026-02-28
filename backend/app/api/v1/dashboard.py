@@ -1,132 +1,151 @@
-from fastapi import APIRouter, Depends, Query
+"""
+Router de dashboard: KPIs y estadísticas del día.
+"""
+from datetime import date, datetime, timezone
+
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from datetime import date, timedelta
 
 from app.dependencies import get_db, get_current_user
 from app.models.remito import Remito, RemitoEstadoClasificacion, RemitoEstadoLifecycle
+from app.models.ruta import Ruta, RutaParada
 from app.models.historico import HistoricoEntregado
-from app.models.ruta import Ruta
 from app.models.usuario import Usuario
-from app.models.billing import BillingTrace
-from typing import Optional
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
-@router.get("/stats")
-async def get_stats(
+@router.get("/")
+async def dashboard(
     db: AsyncSession = Depends(get_db),
-    current_user: Usuario = Depends(get_current_user)
+    current_user: Usuario = Depends(get_current_user),
 ):
+    """KPIs principales del sistema."""
     today = date.today()
+    mes_actual = today.strftime("%Y-%m")
 
-    # Total remitos por estado clasificacion
-    remitos_by_clasificacion = await db.execute(
-        select(Remito.estado_clasificacion, func.count().label("cnt"))
+    # Remitos activos por estado de clasificación
+    clasificacion_rows = await db.execute(
+        select(Remito.estado_clasificacion, func.count(Remito.id))
         .group_by(Remito.estado_clasificacion)
     )
-    clasificacion_counts = {row.estado_clasificacion: row.cnt for row in remitos_by_clasificacion}
+    clasificacion = {k: v for k, v in clasificacion_rows.all()}
 
-    # Total remitos por estado lifecycle
-    remitos_by_lifecycle = await db.execute(
-        select(Remito.estado_lifecycle, func.count().label("cnt"))
+    # Remitos activos por lifecycle
+    lifecycle_rows = await db.execute(
+        select(Remito.estado_lifecycle, func.count(Remito.id))
         .group_by(Remito.estado_lifecycle)
     )
-    lifecycle_counts = {row.estado_lifecycle: row.cnt for row in remitos_by_lifecycle}
+    lifecycle = {k: v for k, v in lifecycle_rows.all()}
 
-    # Histórico del mes actual
-    mes_actual = today.strftime("%Y-%m")
-    historico_mes = (await db.execute(
-        select(func.count()).select_from(HistoricoEntregado)
-        .where(HistoricoEntregado.mes_cierre == mes_actual)
+    # Remitos urgentes y prioridad activos
+    urgentes = (await db.execute(
+        select(func.count(Remito.id)).where(
+            Remito.es_urgente == True,
+            Remito.estado_lifecycle != RemitoEstadoLifecycle.historico.value,
+        )
     )).scalar_one()
 
-    # Última ruta
-    ultima_ruta = (await db.execute(
-        select(Ruta).order_by(Ruta.created_at.desc()).limit(1)
+    prioridad = (await db.execute(
+        select(func.count(Remito.id)).where(
+            Remito.es_prioridad == True,
+            Remito.estado_lifecycle != RemitoEstadoLifecycle.historico.value,
+        )
+    )).scalar_one()
+
+    # Ruta del día
+    ruta_hoy = (await db.execute(
+        select(Ruta).where(Ruta.fecha == today).order_by(Ruta.id.desc()).limit(1)
     )).scalar_one_or_none()
 
-    # Pendientes urgentes
-    urgentes = (await db.execute(
-        select(func.count()).select_from(Remito)
-        .where(
-            Remito.es_urgente == True,
-            Remito.estado_lifecycle == RemitoEstadoLifecycle.ingresado
+    ruta_info = None
+    if ruta_hoy:
+        paradas_completadas = (await db.execute(
+            select(func.count(RutaParada.id)).where(
+                RutaParada.ruta_id == ruta_hoy.id,
+                RutaParada.estado == "entregada",
+            )
+        )).scalar_one()
+        ruta_info = {
+            "id": ruta_hoy.id,
+            "estado": ruta_hoy.estado,
+            "total_paradas": ruta_hoy.total_paradas,
+            "paradas_completadas": paradas_completadas,
+            "total_excluidos": ruta_hoy.total_excluidos,
+            "duracion_estimada_min": ruta_hoy.duracion_estimada_min,
+            "distancia_total_km": ruta_hoy.distancia_total_km,
+        }
+
+    # Histórico del mes actual
+    historico_mes = (await db.execute(
+        select(func.count(HistoricoEntregado.id)).where(
+            HistoricoEntregado.mes_cierre == mes_actual
+        )
+    )).scalar_one()
+
+    # Entregas hoy (en histórico con fecha_entregado = hoy)
+    entregados_hoy = (await db.execute(
+        select(func.count(HistoricoEntregado.id)).where(
+            func.date(HistoricoEntregado.fecha_entregado) == today
         )
     )).scalar_one()
 
     return {
-        "today": str(today),
+        "fecha": str(today),
+        "mes": mes_actual,
         "remitos": {
-            "by_clasificacion": clasificacion_counts,
-            "by_lifecycle": lifecycle_counts,
-            "urgentes_pendientes": urgentes,
+            "por_clasificacion": clasificacion,
+            "por_lifecycle": lifecycle,
+            "urgentes": urgentes,
+            "prioridad": prioridad,
+            "total_activos": sum(
+                v for k, v in lifecycle.items()
+                if k != RemitoEstadoLifecycle.historico.value
+            ),
         },
-        "historico_mes_actual": historico_mes,
-        "ultima_ruta": {
-            "id": ultima_ruta.id if ultima_ruta else None,
-            "fecha": str(ultima_ruta.fecha) if ultima_ruta else None,
-            "estado": ultima_ruta.estado if ultima_ruta else None,
-            "total_paradas": ultima_ruta.total_paradas if ultima_ruta else None,
-        } if ultima_ruta else None,
+        "ruta_hoy": ruta_info,
+        "historico": {
+            "entregas_hoy": entregados_hoy,
+            "entregas_mes_actual": historico_mes,
+        },
     }
 
 
-@router.get("/stats/costos")
-async def get_costos(
-    days: int = Query(30, ge=1, le=90),
+@router.get("/stats/geocoding")
+async def geocoding_stats(
     db: AsyncSession = Depends(get_db),
-    current_user: Usuario = Depends(get_current_user)
+    current_user: Usuario = Depends(get_current_user),
 ):
-    """Resumen de costos de API de los últimos N días."""
-    since = date.today() - timedelta(days=days)
-    result = await db.execute(
-        select(
-            BillingTrace.service,
-            func.sum(BillingTrace.estimated_cost).label("total_cost"),
-            func.sum(BillingTrace.units).label("total_units"),
-            func.count().label("calls")
+    """Estadísticas del geocoding: cobertura, proveedores, score promedio."""
+    total = (await db.execute(
+        select(func.count(Remito.id)).where(
+            Remito.estado_lifecycle != RemitoEstadoLifecycle.historico.value
         )
-        .where(func.date(BillingTrace.created_at) >= since)
-        .group_by(BillingTrace.service)
-        .order_by(func.sum(BillingTrace.estimated_cost).desc())
-    )
-    rows = result.all()
-    total_cost = sum(r.total_cost or 0 for r in rows)
-    return {
-        "period_days": days,
-        "total_cost_usd": round(total_cost, 4),
-        "by_service": [
-            {
-                "service": r.service,
-                "total_cost_usd": round(r.total_cost or 0, 4),
-                "total_units": r.total_units,
-                "calls": r.calls,
-            }
-            for r in rows
-        ]
-    }
+    )).scalar_one()
 
-
-@router.get("/stats/entregas")
-async def get_entregas(
-    months: int = Query(3, ge=1, le=12),
-    db: AsyncSession = Depends(get_db),
-    current_user: Usuario = Depends(get_current_user)
-):
-    """Estadísticas de entregas por mes."""
-    result = await db.execute(
-        select(
-            HistoricoEntregado.mes_cierre,
-            func.count().label("total"),
+    geocodificados = (await db.execute(
+        select(func.count(Remito.id)).where(
+            Remito.lat.isnot(None),
+            Remito.estado_lifecycle != RemitoEstadoLifecycle.historico.value,
         )
-        .group_by(HistoricoEntregado.mes_cierre)
-        .order_by(HistoricoEntregado.mes_cierre.desc())
-        .limit(months)
-    )
-    rows = result.all()
+    )).scalar_one()
+
+    providers = (await db.execute(
+        select(Remito.geocode_provider, func.count(Remito.id))
+        .where(Remito.lat.isnot(None))
+        .group_by(Remito.geocode_provider)
+    )).all()
+
+    avg_score = (await db.execute(
+        select(func.avg(Remito.geocode_score)).where(Remito.geocode_score.isnot(None))
+    )).scalar_one()
+
     return {
-        "months": months,
-        "data": [{"mes": r.mes_cierre, "total_entregas": r.total} for r in rows]
+        "total_remitos": total,
+        "geocodificados": geocodificados,
+        "sin_geocodificar": total - geocodificados,
+        "cobertura_pct": round((geocodificados / total * 100) if total else 0, 1),
+        "por_proveedor": {k or "desconocido": v for k, v in providers},
+        "score_promedio": round(float(avg_score or 0), 3),
     }

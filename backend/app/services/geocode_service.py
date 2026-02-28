@@ -1,21 +1,19 @@
 """
 Geocodificación multi-proveedor con cache en DB.
-Migra: geocodificarDireccion_(), geocodificadorCascade_(), validateGeoResult_(), 
-buscarEnCacheGeo_() del sistema original.
+Migra: geocodificarDireccion_(), geocodificadorCascade_(), validateGeoResult_()
 """
 import logging
-import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from geoalchemy2.functions import ST_MakePoint, ST_SetSRID, ST_X, ST_Y, ST_DWithin
 
 from app.models.geo_cache import GeoCache
 from app.services.address_service import normalize, normalize_key
-from app.core.validators import is_in_mendoza, is_known_city_center
+from app.core.validators import is_in_mendoza
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -27,7 +25,7 @@ class GeocodeResult:
     lng: float
     formatted_address: str
     has_street_number: bool
-    source: str  # 'cache', 'ors', 'mapbox', 'google'
+    source: str          # 'cache', 'ors', 'mapbox', 'google'
     confidence: float = 1.0
     provider: Optional[str] = None
 
@@ -37,10 +35,7 @@ async def geocode(
     address: str,
     provider_override: Optional[str] = None,
 ) -> Optional[GeocodeResult]:
-    """
-    Geocodifica una dirección con cascade: cache DB → ORS → Mapbox → Google.
-    Equivalente a geocodificarDireccion_() del sistema original.
-    """
+    """Geocodifica con cascade: cache DB → ORS → Mapbox → Google."""
     if not address:
         return None
 
@@ -72,8 +67,9 @@ async def geocode(
             logger.warning(f"Geocode {provider} error for '{address}': {e}")
             continue
 
-        if result and _validate_result(result, normalized):
+        if result and _validate_result(result):
             result.source = provider
+            result.provider = provider
             await _save_cache(db, cache_key, address, result)
             return result
 
@@ -82,29 +78,22 @@ async def geocode(
 
 
 async def _lookup_cache(db: AsyncSession, cache_key: str) -> Optional[GeocodeResult]:
-    """Busca en la tabla geo_cache."""
+    """Busca en la tabla geo_cache por key."""
+    now = datetime.now(timezone.utc)
     result = await db.execute(
-        select(GeoCache).where(GeoCache.key_normalizada == cache_key)
+        select(GeoCache).where(
+            GeoCache.key_normalizada == cache_key,
+            GeoCache.expires_at > now,
+        )
     )
     entry = result.scalar_one_or_none()
     if not entry:
         return None
-    # Extraer lat/lng del geom PostGIS
-    lat_result = await db.execute(
-        select(ST_Y(entry.geom))
-    )
-    lng_result = await db.execute(
-        select(ST_X(entry.geom))
-    )
-    # Alternativa: usar WKB directamente
-    from geoalchemy2.shape import to_shape
-    point = to_shape(entry.geom)
-    lat, lng = point.y, point.x
     return GeocodeResult(
-        lat=lat,
-        lng=lng,
+        lat=entry.lat,
+        lng=entry.lng,
         formatted_address=entry.formatted_address or "",
-        has_street_number=entry.has_street_number,
+        has_street_number=entry.has_street_number or False,
         source="cache",
         confidence=entry.score or 1.0,
         provider=entry.provider,
@@ -115,22 +104,43 @@ async def _save_cache(
     db: AsyncSession, cache_key: str, original: str, result: GeocodeResult
 ) -> None:
     """Guarda resultado en geo_cache."""
-    from sqlalchemy import func as sqlfunc
-    geom_wkt = f"SRID=4326;POINT({result.lng} {result.lat})"
+    from app.config import settings as cfg
+    cache_days = 30
+    try:
+        # Intentar leer config de DB
+        from app.models.config import ConfigRuta
+        conf_res = await db.execute(
+            select(ConfigRuta).where(ConfigRuta.key == "geocode_cache_days")
+        )
+        conf = conf_res.scalar_one_or_none()
+        if conf:
+            cache_days = int(conf.value)
+    except Exception:
+        pass
+
+    expires_at = datetime.now(timezone.utc) + timedelta(days=cache_days)
     entry = GeoCache(
         key_normalizada=cache_key,
         query_original=original,
-        geom=f"SRID=4326;POINT({result.lng} {result.lat})",
+        lat=result.lat,
+        lng=result.lng,
         formatted_address=result.formatted_address,
         has_street_number=result.has_street_number,
-        provider=result.provider,
+        provider=result.provider or result.source,
         score=result.confidence,
+        expires_at=expires_at,
     )
     db.add(entry)
     try:
-        await db.commit()
+        await db.flush()
     except Exception:
         await db.rollback()
+        logger.warning(f"Cache save failed for key {cache_key}")
+
+
+def _validate_result(result: GeocodeResult) -> bool:
+    """Valida que el resultado esté dentro de Mendoza."""
+    return is_in_mendoza(result.lat, result.lng)
 
 
 async def _geocode_ors(address: str) -> Optional[GeocodeResult]:
@@ -139,10 +149,10 @@ async def _geocode_ors(address: str) -> Optional[GeocodeResult]:
     params = {
         "api_key": settings.ORS_API_KEY,
         "text": f"{address}, Mendoza, Argentina",
-        "boundary.rect.min_lng": -69.5,
-        "boundary.rect.min_lat": -33.5,
-        "boundary.rect.max_lng": -68.0,
-        "boundary.rect.max_lat": -32.0,
+        "boundary.rect.min_lng": settings.MENDOZA_LNG_MIN,
+        "boundary.rect.min_lat": settings.MENDOZA_LAT_MIN,
+        "boundary.rect.max_lng": settings.MENDOZA_LNG_MAX,
+        "boundary.rect.max_lat": settings.MENDOZA_LAT_MAX,
         "size": 1,
         "layers": "address",
     }
@@ -157,29 +167,26 @@ async def _geocode_ors(address: str) -> Optional[GeocodeResult]:
     feat = features[0]
     coords = feat["geometry"]["coordinates"]  # [lng, lat]
     props = feat.get("properties", {})
-    confidence = props.get("confidence", 0.5)
-    has_num = bool(props.get("housenumber"))
-    formatted = props.get("label", "")
     return GeocodeResult(
         lat=float(coords[1]),
         lng=float(coords[0]),
-        formatted_address=formatted,
-        has_street_number=has_num,
+        formatted_address=props.get("label", ""),
+        has_street_number=bool(props.get("housenumber")),
         source="ors",
-        confidence=confidence,
+        confidence=props.get("confidence", 0.5),
         provider="ors",
     )
 
 
 async def _geocode_mapbox(address: str) -> Optional[GeocodeResult]:
-    """Mapbox geocoding."""
+    """Mapbox Geocoding API."""
     import urllib.parse
     encoded = urllib.parse.quote(f"{address}, Mendoza, Argentina")
     url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{encoded}.json"
     params = {
         "access_token": settings.MAPBOX_TOKEN,
         "country": "ar",
-        "bbox": "-69.5,-33.5,-68.0,-32.0",
+        "bbox": f"{settings.MENDOZA_LNG_MIN},{settings.MENDOZA_LAT_MIN},{settings.MENDOZA_LNG_MAX},{settings.MENDOZA_LAT_MAX}",
         "limit": 1,
         "types": "address",
     }
@@ -193,17 +200,14 @@ async def _geocode_mapbox(address: str) -> Optional[GeocodeResult]:
         return None
     feat = features[0]
     coords = feat["geometry"]["coordinates"]  # [lng, lat]
-    relevance = feat.get("relevance", 0.5)
-    formatted = feat.get("place_name", "")
-    context = feat.get("context", [])
     has_num = "address" in feat.get("place_type", [])
     return GeocodeResult(
         lat=float(coords[1]),
         lng=float(coords[0]),
-        formatted_address=formatted,
+        formatted_address=feat.get("place_name", ""),
         has_street_number=has_num,
         source="mapbox",
-        confidence=relevance,
+        confidence=feat.get("relevance", 0.5),
         provider="mapbox",
     )
 
@@ -214,7 +218,7 @@ async def _geocode_google(address: str) -> Optional[GeocodeResult]:
     params = {
         "address": f"{address}, Mendoza, Argentina",
         "key": settings.GOOGLE_MAPS_API_KEY,
-        "components": "country:AR|administrative_area:Mendoza",
+        "components": "country:AR",
     }
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(url, params=params)
@@ -226,37 +230,70 @@ async def _geocode_google(address: str) -> Optional[GeocodeResult]:
         return None
     r = results[0]
     loc = r["geometry"]["location"]
-    address_components = r.get("address_components", [])
-    has_num = any(
-        "street_number" in c.get("types", []) for c in address_components
-    )
-    formatted = r.get("formatted_address", "")
-    # Google no da confidence — usar location_type como proxy
-    lt = r["geometry"].get("location_type", "APPROXIMATE")
-    confidence_map = {"ROOFTOP": 0.99, "RANGE_INTERPOLATED": 0.8, "GEOMETRIC_CENTER": 0.6, "APPROXIMATE": 0.3}
-    confidence = confidence_map.get(lt, 0.5)
+    components = r.get("address_components", [])
+    has_num = any("street_number" in c.get("types", []) for c in components)
     return GeocodeResult(
         lat=float(loc["lat"]),
         lng=float(loc["lng"]),
-        formatted_address=formatted,
+        formatted_address=r.get("formatted_address", ""),
         has_street_number=has_num,
         source="google",
-        confidence=confidence,
+        confidence=0.9,
         provider="google",
     )
 
 
-def _validate_result(result: GeocodeResult, query: str) -> bool:
-    """
-    Valida un resultado geocodificado.
-    Equivalente a validateGeoResult_() del sistema original.
-    """
+async def get_cache_stats(db: AsyncSession) -> dict:
+    """Estadísticas del caché de geocodificación."""
+    from sqlalchemy import func
+    result = await db.execute(
+        select(GeoCache.provider, func.count().label("cnt"))
+        .group_by(GeoCache.provider)
+    )
+    by_provider = {row.provider: row.cnt for row in result}
+    total = sum(by_provider.values())
+    return {"total": total, "by_provider": by_provider}
+
+
+async def clear_cache(db: AsyncSession) -> int:
+    """Limpia el caché completo."""
+    from sqlalchemy import delete
+    result = await db.execute(delete(GeoCache))
+    await db.commit()
+    return result.rowcount
+
+
+async def validate_address(db: AsyncSession, address: str) -> dict:
+    """Valida una dirección y retorna resultado."""
+    result = await geocode(db, address)
     if not result:
-        return False
-    if result.lat == 0 and result.lng == 0:
-        return False
-    if not is_in_mendoza(result.lat, result.lng):
-        return False
-    if is_known_city_center(result.lat, result.lng):
-        return False
-    return True
+        return {"valid": False, "address": address, "reason": "No geocodificado"}
+    return {
+        "valid": True,
+        "address": address,
+        "lat": result.lat,
+        "lng": result.lng,
+        "formatted": result.formatted_address,
+        "has_street_number": result.has_street_number,
+        "provider": result.provider,
+        "confidence": result.confidence,
+    }
+
+
+async def geocode_batch(
+    db: AsyncSession,
+    addresses: list[str],
+) -> list[dict]:
+    """Geocodifica una lista de direcciones."""
+    results = []
+    for addr in addresses:
+        res = await geocode(db, addr)
+        results.append({
+            "address": addr,
+            "ok": res is not None,
+            "lat": res.lat if res else None,
+            "lng": res.lng if res else None,
+            "formatted": res.formatted_address if res else None,
+            "provider": res.provider if res else None,
+        })
+    return results

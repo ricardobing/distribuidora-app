@@ -1,10 +1,6 @@
 import enum
-from sqlalchemy import (
-    Column, Integer, String, Boolean, Text, DateTime, Float, ForeignKey
-)
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, Integer, String, Boolean, Text, DateTime, Float, ForeignKey
 from sqlalchemy.sql import func
-from geoalchemy2 import Geometry
 from app.database import Base
 
 
@@ -30,66 +26,48 @@ class Remito(Base):
     __tablename__ = "remitos"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    numero = Column(String(50), nullable=False, unique=True)
+    numero = Column(String(100), nullable=False, unique=True)
+    cliente = Column(String(500), nullable=True)
+    telefono = Column(String(50), nullable=True)
+    direccion_raw = Column(Text, nullable=True)
+    direccion_normalizada = Column(Text, nullable=True)
+    localidad = Column(String(200), nullable=True)
+    observaciones = Column(Text, nullable=True)
 
-    # Datos del remito
-    cliente = Column(String(255), nullable=True)
-    domicilio_raw = Column(Text, nullable=True)
-    domicilio_normalizado = Column(Text, nullable=True)
-    localidad = Column(String(100), nullable=True)
-    provincia = Column(String(100), nullable=True)
-    observaciones_pl = Column(Text, nullable=True)
-    observaciones_entrega = Column(Text, nullable=True)
-    transporte_raw = Column(String(255), nullable=True)
+    # Geo — coordenadas planas (no GeoAlchemy2 para compatibilidad async)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    geocode_provider = Column(String(50), nullable=True)
+    geocode_score = Column(Float, nullable=True)
+    geocode_formatted = Column(Text, nullable=True)
 
     # Clasificación
-    carrier_id = Column(Integer, ForeignKey("carriers.id"), nullable=True)
-    estado_clasificacion = Column(
-        String(30),
-        nullable=False,
-        default=RemitoEstadoClasificacion.pendiente.value,
-    )
+    estado_clasificacion = Column(String(50), nullable=False,
+                                  default=RemitoEstadoClasificacion.pendiente.value)
+    estado_lifecycle = Column(String(50), nullable=False,
+                              default=RemitoEstadoLifecycle.ingresado.value)
     motivo_clasificacion = Column(Text, nullable=True)
+    carrier_id = Column(Integer, ForeignKey("carriers.id", ondelete="SET NULL"), nullable=True)
 
-    # Ciclo de vida
-    estado_lifecycle = Column(
-        String(20),
-        nullable=False,
-        default=RemitoEstadoLifecycle.ingresado.value,
-    )
-
-    # Geocodificación — PostGIS POINT(lng lat) SRID 4326
-    geom = Column(Geometry(geometry_type="POINT", srid=4326), nullable=True)
-    geocode_formatted = Column(Text, nullable=True)
-    geocode_has_street_num = Column(Boolean, default=False)
-    geocode_source = Column(String(20), nullable=True)  # 'cache','ors','mapbox','google'
-    geocode_confidence = Column(Float, nullable=True)
-
-    # Ventana horaria
-    ventana_tipo = Column(String(20), nullable=True)  # 'AM', 'PM', 'SIN_HORARIO'
-    ventana_desde_min = Column(Integer, nullable=True)  # minutos desde medianoche
-    ventana_hasta_min = Column(Integer, nullable=True)
+    # Ventana horaria (minutos desde medianoche)
     ventana_raw = Column(Text, nullable=True)
-    llamar_antes = Column(Boolean, default=False)
+    ventana_tipo = Column(String(50), nullable=True)
+    ventana_desde_min = Column(Integer, nullable=True)
+    ventana_hasta_min = Column(Integer, nullable=True)
+    llamar_antes = Column(Boolean, nullable=False, default=False)
 
-    # Flags de prioridad
-    urgente = Column(Boolean, nullable=False, default=False)
-    prioridad = Column(Boolean, nullable=False, default=False)
+    # Flags
+    es_urgente = Column(Boolean, nullable=False, default=False)
+    es_prioridad = Column(Boolean, nullable=False, default=False)
 
-    # Metadata
-    seq_id = Column(String(50), nullable=True)
-    source = Column(String(20), nullable=False, default="manual")
-    motivo_exclusion_ruta = Column(Text, nullable=True)
-    transp_json = Column(JSONB, nullable=True)
+    # Meta
+    pipeline_error = Column(Text, nullable=True)
+    source = Column(String(100), nullable=True, default="manual")
 
-    # Timestamps
+    # Timestamps ciclo de vida
     fecha_ingreso = Column(DateTime(timezone=True), server_default=func.now())
     fecha_armado = Column(DateTime(timezone=True), nullable=True)
     fecha_entregado = Column(DateTime(timezone=True), nullable=True)
     fecha_historico = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

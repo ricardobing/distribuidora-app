@@ -16,5 +16,5 @@ class ErrorResponse(BaseModel):
 
 
 class OkResponse(BaseModel):
-    ok: bool
+    ok: bool = True
     message: Optional[str] = None

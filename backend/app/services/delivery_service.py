@@ -1,206 +1,153 @@
 """
-Delivery service: ARMADO → ENTREGADO → HISTÓRICO.
-Migra: QR handlers, procesarEntregadosDesdeMenu(), movimiento a HISTÓRICO_ENTREGADOS.
+Delivery service: marca remitos como entregados / mueve a histórico.
 """
 import logging
 from datetime import datetime, timezone
-from dataclasses import dataclass
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.remito import Remito, RemitoEstadoLifecycle
+from app.models.ruta import RutaParada, ParadaEstado
 from app.models.historico import HistoricoEntregado
 from app.models.carrier import Carrier
-from app.core.constants import CODE_VERSION
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class QRResult:
-    ok: bool
-    remito: str
-    message: str
-    version: str = CODE_VERSION
-
-
-@dataclass
-class EntregadoResult:
-    ok: bool
-    procesados: int
-    rechazados: list[dict]
-
-
-@dataclass
-class HistoricoResult:
-    ok: bool
-    movidos: int
-    rechazados: list[dict]
-
-
-async def scan_qr(db: AsyncSession, numero: str) -> QRResult:
-    """
-    Procesa un escaneo QR: marca el remito como ARMADO.
-    Idempotente: re-escaneo devuelve "Ya estaba ARMADO".
-    DESPACHADO no retrocede.
-    Migra: _procesarUnRemito_() del sistema original.
-    """
-    numero = numero.strip().upper()
-    result = await db.execute(
-        select(Remito).where(Remito.numero == numero)
-    )
+async def scan_qr(db: AsyncSession, numero: str) -> dict:
+    """Escanea QR: busca remito por número y retorna estado."""
+    result = await db.execute(select(Remito).where(Remito.numero == numero.upper()))
     remito = result.scalar_one_or_none()
+    if remito is None:
+        return {"encontrado": False, "numero": numero, "mensaje": "Remito no encontrado"}
 
-    if not remito:
-        return QRResult(ok=False, remito=numero, message=f"Remito {numero} no encontrado")
+    carrier_nombre = None
+    if remito.carrier_id:
+        cres = await db.execute(select(Carrier).where(Carrier.id == remito.carrier_id))
+        c = cres.scalar_one_or_none()
+        carrier_nombre = c.nombre_canonico if c else None
 
-    lifecycle = remito.estado_lifecycle
-
-    if lifecycle == RemitoEstadoLifecycle.armado.value:
-        return QRResult(ok=True, remito=numero, message=f"Remito {numero} ya estaba ARMADO")
-
-    if lifecycle in (
-        RemitoEstadoLifecycle.despachado.value,
-        RemitoEstadoLifecycle.entregado.value,
-        RemitoEstadoLifecycle.historico.value,
-    ):
-        return QRResult(
-            ok=False,
-            remito=numero,
-            message=f"Remito {numero} en estado {lifecycle.upper()}, no puede retroceder",
-        )
-
-    prev_state = lifecycle
-    remito.estado_lifecycle = RemitoEstadoLifecycle.armado.value
-    remito.fecha_armado = datetime.now(timezone.utc)
-    remito.updated_at = datetime.now(timezone.utc)
-    await db.commit()
-
-    return QRResult(
-        ok=True,
-        remito=numero,
-        message=f"Remito {numero} marcado como ARMADO (antes: {prev_state.upper()})",
-    )
+    return {
+        "encontrado": True,
+        "id": remito.id,
+        "numero": remito.numero,
+        "cliente": remito.cliente,
+        "direccion": remito.direccion_normalizada or remito.direccion_raw,
+        "estado_lifecycle": remito.estado_lifecycle,
+        "estado_clasificacion": remito.estado_clasificacion,
+        "carrier_nombre": carrier_nombre,
+        "es_urgente": remito.es_urgente,
+        "es_prioridad": remito.es_prioridad,
+        "lat": remito.lat,
+        "lng": remito.lng,
+    }
 
 
-async def mark_entregado(
-    db: AsyncSession, remito_ids: list[int]
-) -> EntregadoResult:
+async def mark_entregado(db: AsyncSession, ids: list[int]) -> int:
     """
-    Marca remitos como ENTREGADO.
-    Requiere que estén en estado ARMADO.
+    Marca un lote de remitos como entregados.
+    Actualiza estado_lifecycle → 'entregado' y la parada activa → 'entregada'.
+    Retorna cantidad procesada.
     """
-    procesados = 0
-    rechazados = []
+    count = 0
+    now = datetime.now(timezone.utc)
 
-    for rid in remito_ids:
-        result = await db.execute(select(Remito).where(Remito.id == rid))
+    for remito_id in ids:
+        result = await db.execute(select(Remito).where(Remito.id == remito_id))
         remito = result.scalar_one_or_none()
         if not remito:
-            rechazados.append({"id": rid, "motivo": "No encontrado"})
             continue
-        if remito.estado_lifecycle != RemitoEstadoLifecycle.armado.value:
-            rechazados.append({
-                "id": rid,
-                "numero": remito.numero,
-                "motivo": f"Estado actual: {remito.estado_lifecycle} (requiere ARMADO)",
-            })
-            continue
+
         remito.estado_lifecycle = RemitoEstadoLifecycle.entregado.value
-        remito.fecha_entregado = datetime.now(timezone.utc)
-        remito.updated_at = datetime.now(timezone.utc)
-        procesados += 1
+        remito.fecha_entregado = now
+
+        # Actualizar parada activa si existe
+        parada_res = await db.execute(
+            select(RutaParada).where(
+                RutaParada.remito_id == remito_id,
+                RutaParada.estado == ParadaEstado.pendiente.value,
+            ).order_by(RutaParada.id.desc()).limit(1)
+        )
+        parada = parada_res.scalar_one_or_none()
+        if parada:
+            parada.estado = ParadaEstado.entregada.value
+
+        count += 1
 
     await db.commit()
-    return EntregadoResult(ok=True, procesados=procesados, rechazados=rechazados)
+    return count
 
 
-async def move_to_historico(
-    db: AsyncSession, remito_ids: list[int]
-) -> HistoricoResult:
+async def move_to_historico(db: AsyncSession, ids: list[int]) -> int:
     """
-    Mueve remitos ENTREGADOS al histórico.
-    Crea snapshot en historico_entregados y cambia estado a 'historico'.
+    Mueve remitos entregados al histórico.
+    Crea HistoricoEntregado y actualiza estado_lifecycle → 'historico'.
     """
-    movidos = 0
-    rechazados = []
+    count = 0
     now = datetime.now(timezone.utc)
     mes_cierre = now.strftime("%Y-%m")
 
-    for rid in remito_ids:
-        result = await db.execute(select(Remito).where(Remito.id == rid))
+    for remito_id in ids:
+        result = await db.execute(select(Remito).where(Remito.id == remito_id))
         remito = result.scalar_one_or_none()
         if not remito:
-            rechazados.append({"id": rid, "motivo": "No encontrado"})
-            continue
-        if remito.estado_lifecycle != RemitoEstadoLifecycle.entregado.value:
-            rechazados.append({
-                "id": rid,
-                "numero": remito.numero,
-                "motivo": f"Estado actual: {remito.estado_lifecycle} (requiere ENTREGADO)",
-            })
             continue
 
-        # Obtener carrier nombre
         carrier_nombre = None
         if remito.carrier_id:
-            c_result = await db.execute(select(Carrier).where(Carrier.id == remito.carrier_id))
-            carrier = c_result.scalar_one_or_none()
-            carrier_nombre = carrier.nombre_canonico if carrier else None
+            cres = await db.execute(select(Carrier).where(Carrier.id == remito.carrier_id))
+            c = cres.scalar_one_or_none()
+            carrier_nombre = c.nombre_canonico if c else None
+
+        fecha_entregado = remito.fecha_entregado or now
 
         historico = HistoricoEntregado(
             remito_id=remito.id,
-            numero_remito=remito.numero,
-            cliente=remito.cliente,
-            domicilio=remito.domicilio_normalizado,
-            provincia=remito.provincia,
-            observaciones=remito.observaciones_pl,
+            numero=remito.numero,
+            cliente=remito.cliente or "",
+            direccion_snapshot=remito.direccion_normalizada or remito.direccion_raw or "",
+            localidad=remito.localidad,
+            observaciones=remito.observaciones or "",
+            lat=remito.lat,
+            lng=remito.lng,
             carrier_nombre=carrier_nombre,
+            es_urgente=remito.es_urgente,
+            es_prioridad=remito.es_prioridad,
+            obs_entrega="",
             estado_al_archivar=remito.estado_lifecycle,
-            geom=remito.geom,
-            urgente=remito.urgente,
-            prioridad=remito.prioridad,
-            obs_entrega=remito.observaciones_entrega,
-            transp_json=remito.transp_json,
             fecha_ingreso=remito.fecha_ingreso,
             fecha_armado=remito.fecha_armado,
-            fecha_entregado=remito.fecha_entregado or now,
-            fecha_archivado=now,
+            fecha_entregado=fecha_entregado,
             mes_cierre=mes_cierre,
         )
         db.add(historico)
+
         remito.estado_lifecycle = RemitoEstadoLifecycle.historico.value
         remito.fecha_historico = now
-        remito.updated_at = now
-        movidos += 1
+        count += 1
 
     await db.commit()
-    return HistoricoResult(ok=True, movidos=movidos, rechazados=rechazados)
+    return count
 
 
-async def restore_from_historico(
-    db: AsyncSession, historico_id: int
-) -> Optional[Remito]:
+async def restore_from_historico(db: AsyncSession, historico_id: int) -> None:
     """Restaura un remito del histórico a estado activo (ingresado)."""
     result = await db.execute(
         select(HistoricoEntregado).where(HistoricoEntregado.id == historico_id)
     )
-    hist = result.scalar_one_or_none()
-    if not hist:
-        return None
+    historico = result.scalar_one_or_none()
+    if not historico:
+        raise ValueError(f"Histórico {historico_id} no encontrado")
 
-    result2 = await db.execute(
-        select(Remito).where(Remito.id == hist.remito_id)
-    )
-    remito = result2.scalar_one_or_none()
-    if not remito:
-        return None
+    if historico.remito_id:
+        rres = await db.execute(select(Remito).where(Remito.id == historico.remito_id))
+        remito = rres.scalar_one_or_none()
+        if remito:
+            remito.estado_lifecycle = RemitoEstadoLifecycle.ingresado.value
+            remito.fecha_entregado = None
+            remito.fecha_historico = None
 
-    remito.estado_lifecycle = RemitoEstadoLifecycle.ingresado.value
-    remito.fecha_historico = None
-    remito.updated_at = datetime.now(timezone.utc)
+    await db.delete(historico)
     await db.commit()
-    await db.refresh(remito)
-    return remito

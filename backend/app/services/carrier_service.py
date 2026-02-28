@@ -1,7 +1,6 @@
 """
 Carrier detection service.
 Migra: classifyTransportRegex_(), classifyTransportAI_(), determinarCategoriaFinal_()
-del sistema original (code.js).
 """
 import re
 import logging
@@ -26,33 +25,40 @@ class CarrierDetection:
     confidence: float = 1.0
 
 
+def detect_pickup(texto: str) -> bool:
+    """Detecta si el texto indica un retiro (sync, sin DB)."""
+    if not texto:
+        return False
+    return bool(re.search(RE_PICKUP, texto.upper(), re.IGNORECASE))
+
+
 async def detect(
     db: AsyncSession,
     texto: str,
     provincia: Optional[str] = None,
 ) -> CarrierDetection:
     """
-    Cascade de detección de carrier.
+    Cascade de detección de carrier:
     1. Pickup regex (hardcoded)
     2. Carriers de DB con regex (prioridad_regex ASC)
-    3. AI fallback → re-validate through regex
-    4. Reglas finales (provincia, default Mendoza)
+    3. AI fallback
+    4. Reglas finales
     """
     if not texto:
         texto = ""
     upper_text = texto.upper()
 
-    # 1. Pickup hardcoded (mayor prioridad)
+    # 1. Pickup hardcoded
     if re.search(RE_PICKUP, upper_text, re.IGNORECASE):
-        carrier = await _find_by_name(db, "RETIRO EN COMERCIAL")
+        carrier = await _find_by_name(db, "RETIRO EN GALPON")
         return CarrierDetection(
             carrier_id=carrier.id if carrier else None,
-            nombre_canonico="RETIRO EN COMERCIAL",
+            nombre_canonico="RETIRO EN GALPON",
             source="regex",
             confidence=1.0,
         )
 
-    # 2. Regex de DB (ordenados por prioridad)
+    # 2. Regex de DB ordenados por prioridad
     result = await db.execute(
         select(Carrier)
         .where(Carrier.activo == True, Carrier.regex_pattern.isnot(None))  # noqa: E712
@@ -75,7 +81,6 @@ async def detect(
     # 3. AI fallback
     ai_result = await ai_service.classify_transport(texto)
     if ai_result and ai_result.confianza >= 0.85:
-        # Re-validar el resultado AI contra regex
         for carrier in carriers:
             if carrier.nombre_canonico.upper() == ai_result.transportista.upper():
                 return CarrierDetection(
@@ -93,25 +98,22 @@ async def _determinar_categoria_final(
     db: AsyncSession,
     provincia: Optional[str],
 ) -> CarrierDetection:
-    """
-    Reglas de fallback cuando no se detectó carrier.
-    Equivalente a determinarCategoriaFinal_().
-    """
+    """Fallback cuando no se detectó carrier."""
     if provincia and provincia.upper().strip() != "MENDOZA":
         carrier = await _find_by_name(db, "DESCONOCIDO")
         return CarrierDetection(
             carrier_id=carrier.id if carrier else None,
             nombre_canonico="DESCONOCIDO",
             source="rule",
-            confidence=0.7,
+            confidence=0.5,
         )
-    # Mendoza sin carrier → envío propio
-    carrier = await _find_by_name(db, "ENVÍO PROPIO (MOLLY MARKET)")
+
+    carrier = await _find_by_name(db, "ENVIO PROPIO")
     return CarrierDetection(
         carrier_id=carrier.id if carrier else None,
-        nombre_canonico="ENVÍO PROPIO (MOLLY MARKET)",
+        nombre_canonico="ENVIO PROPIO",
         source="default",
-        confidence=0.6,
+        confidence=0.5,
     )
 
 
@@ -120,8 +122,3 @@ async def _find_by_name(db: AsyncSession, nombre: str) -> Optional[Carrier]:
         select(Carrier).where(Carrier.nombre_canonico == nombre)
     )
     return result.scalar_one_or_none()
-
-
-def detect_pickup(texto: str) -> bool:
-    """Verifica si el texto indica retiro en comercial."""
-    return bool(re.search(RE_PICKUP, texto.upper(), re.IGNORECASE))

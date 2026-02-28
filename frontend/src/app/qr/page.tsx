@@ -29,7 +29,8 @@ export default function QRPage() {
 
   useEffect(() => {
     if (mode !== "camera") return;
-    let scanner: { stop: () => Promise<void> } | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let scanner: any = null;
 
     import("html5-qrcode").then(({ Html5QrcodeScanner }) => {
       scanner = new Html5QrcodeScanner(
@@ -49,7 +50,7 @@ export default function QRPage() {
     });
 
     return () => {
-      scanner?.stop().catch(() => {});
+      scanner?.clear().catch(() => {});
     };
   }, [mode]);
 

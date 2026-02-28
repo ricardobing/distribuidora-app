@@ -77,9 +77,9 @@ async def cierre_mensual(
     db: AsyncSession = Depends(get_db),
     current_user: Usuario = Depends(require_operador)
 ):
-    """Ejecuta el cierre mensual: mueve todos los entregados al histórico."""
+    """Ejecuta el cierre mensual: reporta registros del mes anterior."""
     count = await monthly_close(db)
-    return OkResponse(message=f"Cierre mensual completado: {count} remitos archivados")
+    return OkResponse(ok=True, message=f"Cierre mensual completado: {count} remitos archivados")
 
 
 def _to_dict(h: HistoricoEntregado) -> dict:
