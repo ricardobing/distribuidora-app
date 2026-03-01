@@ -17,8 +17,19 @@ export default function LoginPage() {
     try {
       await login({ email, password });
       router.push("/dashboard");
-    } catch {
-      toast.error("Credenciales incorrectas");
+    } catch (err: unknown) {
+      if (err && typeof err === "object" && "response" in err) {
+        const axErr = err as { response?: { status?: number } };
+        if (axErr.response?.status === 401) {
+          toast.error("Credenciales incorrectas");
+        } else if (axErr.response?.status === 429) {
+          toast.error("Demasiados intentos. Esperá un momento.");
+        } else {
+          toast.error("Error del servidor. Intentá de nuevo.");
+        }
+      } else {
+        toast.error("No se pudo conectar al servidor.");
+      }
     } finally {
       setLoading(false);
     }

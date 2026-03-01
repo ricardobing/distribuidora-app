@@ -15,11 +15,11 @@ import type {
   QRResult,
 } from "./types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
 
 function createClient(): AxiosInstance {
   const client = axios.create({
-    baseURL: `${API_URL}/api/v1`,
+    baseURL: API_URL,
     headers: { "Content-Type": "application/json" },
   });
 
@@ -131,7 +131,7 @@ export const entregadosApi = {
 export const historicoApi = {
   list: (params?: Record<string, unknown>) =>
     api.get<PaginatedResponse<HistoricoItem>>("/historico", { params }).then((r) => r.data),
-  exportUrl: (mes: string) => `${API_URL}/api/v1/historico/export/${mes}`,
+  exportUrl: (mes: string) => `${API_URL}/historico/export/${mes}`,
   restaurar: (id: number) =>
     api.post(`/historico/restaurar/${id}`).then((r) => r.data),
   cierreMensual: () =>

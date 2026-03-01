@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: List[str] = [
         "https://molymarket.vercel.app",
         "http://localhost:3000",
+        "http://localhost:3001",
     ]
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
