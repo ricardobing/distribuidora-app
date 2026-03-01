@@ -59,5 +59,33 @@ class Settings(BaseSettings):
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
+    def validate_for_production(self) -> None:
+        """Aborta el inicio si la configuracion es insegura en produccion."""
+        if self.ENVIRONMENT != "production":
+            return
+
+        weak_keys = {
+            "changeme-use-a-real-secret-in-production",
+            "change-me-in-production-at-least-32-chars",
+            "change-me",
+            "secret",
+            "",
+        }
+        if any(self.SECRET_KEY.startswith(w) for w in weak_keys) or len(self.SECRET_KEY) < 32:
+            raise RuntimeError(
+                "SECRET_KEY inseguro en produccion. "
+                "Generar con: python -c 'import secrets; print(secrets.token_hex(32))'"
+            )
+
+        # Extraer password de DATABASE_URL para validarlo
+        from urllib.parse import urlparse
+        parsed = urlparse(self.DATABASE_URL.replace("+asyncpg", ""))
+        db_password = parsed.password or ""
+        if db_password in ("", "molypass", "postgres", "password"):
+            raise RuntimeError(
+                "La password de PostgreSQL en DATABASE_URL es insegura para produccion. "
+                "Usar una password fuerte y unica."
+            )
+
 
 settings = Settings()

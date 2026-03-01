@@ -3,7 +3,7 @@ Router de autenticación y gestión de usuarios.
 """
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, status, Path
+from fastapi import APIRouter, Depends, HTTPException, Request, status, Path
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -18,13 +18,15 @@ from app.core.security import (
     hash_password, verify_password, create_access_token,
 )
 from app.config import settings
+from app.main import limiter
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
-    """Autentica usuario y devuelve JWT."""
+@limiter.limit("10/minute")
+async def login(request: Request, body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    """Autentica usuario y devuelve JWT. Limite: 10 intentos por minuto por IP."""
     result = await db.execute(
         select(Usuario).where(Usuario.email == body.email.lower().strip())
     )
